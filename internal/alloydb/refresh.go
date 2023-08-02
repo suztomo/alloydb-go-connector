@@ -28,8 +28,8 @@ import (
 	"strings"
 	"time"
 
-	alloydbadmin "cloud.google.com/go/alloydb/apiv1beta"
-	"cloud.google.com/go/alloydb/apiv1beta/alloydbpb"
+	alloydbadmin "cloud.google.com/go/alloydb/apiv1alpha"
+	"cloud.google.com/go/alloydb/apiv1alpha/alloydbpb"
 	"cloud.google.com/go/alloydbconn/errtype"
 	"cloud.google.com/go/alloydbconn/internal/trace"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -109,8 +109,9 @@ func fetchEphemeralCert(
 		Parent: fmt.Sprintf(
 			"projects/%s/locations/%s/clusters/%s", inst.project, inst.region, inst.cluster,
 		),
-		PemCsr:       buf.String(),
-		CertDuration: durationpb.New(time.Second * 3600),
+		PemCsr:              buf.String(),
+		CertDuration:        durationpb.New(time.Second * 3600),
+		UseMetadataExchange: true,
 	}
 	resp, err := cl.GenerateClientCertificate(ctx, req)
 	if err != nil {

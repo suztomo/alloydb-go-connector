@@ -19,6 +19,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	_ "embed"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -26,13 +28,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	alloydbadmin "cloud.google.com/go/alloydb/apiv1beta"
+	alloydbadmin "cloud.google.com/go/alloydb/apiv1alpha"
+	"cloud.google.com/go/alloydb/connectors/apiv1alpha/connectorspb"
 	"cloud.google.com/go/alloydbconn/errtype"
 	"cloud.google.com/go/alloydbconn/internal/alloydb"
 	"cloud.google.com/go/alloydbconn/internal/trace"
 	"github.com/google/uuid"
 	"golang.org/x/net/proxy"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -41,6 +47,9 @@ const (
 	defaultTCPKeepAlive = 30 * time.Second
 	// serverProxyPort is the port the server-side proxy receives connections on.
 	serverProxyPort = "5433"
+	// ioTimeout is the maximum amount of time to wait before aborting a
+	// metadata exhange
+	ioTimeout = time.Minute
 )
 
 var (
@@ -85,6 +94,12 @@ type Dialer struct {
 	// dialFunc is the function used to connect to the address on the named
 	// network. By default it is golang.org/x/net/proxy#Dial.
 	dialFunc func(cxt context.Context, network, addr string) (net.Conn, error)
+
+	useIAMAuthN bool
+	tokenSource oauth2.TokenSource
+	userAgent   string
+
+	buffer *buffer
 }
 
 // NewDialer creates a new Dialer.
@@ -96,7 +111,7 @@ func NewDialer(ctx context.Context, opts ...Option) (*Dialer, error) {
 	cfg := &dialerConfig{
 		refreshTimeout: alloydb.RefreshTimeout,
 		dialFunc:       proxy.Dial,
-		useragents:     []string{userAgent},
+		userAgents:     []string{userAgent},
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -104,8 +119,9 @@ func NewDialer(ctx context.Context, opts ...Option) (*Dialer, error) {
 			return nil, cfg.err
 		}
 	}
+	userAgent := strings.Join(cfg.userAgents, " ")
 	// Add this to the end to make sure it's not overridden
-	cfg.adminOpts = append(cfg.adminOpts, option.WithUserAgent(strings.Join(cfg.useragents, " ")))
+	cfg.adminOpts = append(cfg.adminOpts, option.WithUserAgent(userAgent))
 
 	if cfg.rsaKey == nil {
 		key, err := getDefaultKeys()
@@ -113,6 +129,16 @@ func NewDialer(ctx context.Context, opts ...Option) (*Dialer, error) {
 			return nil, fmt.Errorf("failed to generate RSA keys: %v", err)
 		}
 		cfg.rsaKey = key
+	}
+
+	// If no token source is configured, use ADC's token source.
+	ts := cfg.tokenSource
+	if ts == nil {
+		var err error
+		ts, err = google.DefaultTokenSource(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	client, err := alloydbadmin.NewAlloyDBAdminRESTClient(ctx, cfg.adminOpts...)
@@ -138,6 +164,10 @@ func NewDialer(ctx context.Context, opts ...Option) (*Dialer, error) {
 		defaultDialCfg: dialCfg,
 		dialerID:       uuid.New().String(),
 		dialFunc:       cfg.dialFunc,
+		useIAMAuthN:    cfg.useIAMAuthN,
+		tokenSource:    ts,
+		userAgent:      userAgent,
+		buffer:         newBuffer(),
 	}
 	return d, nil
 }
@@ -206,6 +236,12 @@ func (d *Dialer) Dial(ctx context.Context, instance string, opts ...DialOption) 
 	if err != nil {
 		return nil, err
 	}
+	// The metadata exchange must occur after the TLS connection is established
+	// to avoid leaking sensitive information.
+	err = d.metadataExchange(tlsConn)
+	if err != nil {
+		return nil, err
+	}
 	latency := time.Since(startTime).Milliseconds()
 	go func() {
 		n := atomic.AddUint64(&i.OpenConns, 1)
@@ -217,6 +253,119 @@ func (d *Dialer) Dial(ctx context.Context, instance string, opts ...DialOption) 
 		n := atomic.AddUint64(&i.OpenConns, ^uint64(0))
 		trace.RecordOpenConnections(context.Background(), int64(n), d.dialerID, i.String())
 	}), nil
+}
+
+// metadataExchange sends metadata about the connection prior to the database
+// protocol taking over. The exchange consists of four steps:
+//
+//  1. Prepare a MetadataExchangeRequest including the IAM Principal's OAuth2
+//     token, the user agent, and the requested authentication type.
+//
+//  2. Write the size of the message as a big endian uint32 (4 bytes) to the
+//     server followed by the marshaled message. The length does not include the
+//     initial four bytes.
+//
+//  3. Read a big endian uint32 (4 bytes) from the server. This is the
+//     MetadataExchangeResponse message length and does not include the initial
+//     four bytes.
+//
+//  4. Unmarshal the response using the message length in step 3. If the
+//     response is not OK, return the response's error. If there is no error, the
+//     metadata exchange has succeeded and the connection is complete.
+//
+// Subsequent interactions with the test server use the database protocol.
+func (d *Dialer) metadataExchange(conn net.Conn) error {
+	tok, err := d.tokenSource.Token()
+	if err != nil {
+		return err
+	}
+	authType := connectorspb.MetadataExchangeRequest_DB_NATIVE
+	if d.useIAMAuthN {
+		authType = connectorspb.MetadataExchangeRequest_AUTO_IAM
+	}
+	req := &connectorspb.MetadataExchangeRequest{
+		UserAgent:   d.userAgent,
+		AuthType:    authType,
+		Oauth2Token: tok.AccessToken,
+	}
+	m, err := proto.Marshal(req)
+	if err != nil {
+		return err
+	}
+	b := d.buffer.get()
+	defer d.buffer.put(b)
+
+	buf := *b
+	reqSize := proto.Size(req)
+	binary.BigEndian.PutUint32(buf, uint32(reqSize))
+	buf = append(buf[:4], m...)
+
+	// Set IO deadline before write
+	err = conn.SetDeadline(time.Now().Add(ioTimeout))
+	if err != nil {
+		return err
+	}
+	defer conn.SetDeadline(time.Time{})
+
+	_, err = conn.Write(buf)
+	if err != nil {
+		return err
+	}
+
+	// Reset IO deadline before read
+	err = conn.SetDeadline(time.Now().Add(ioTimeout))
+	if err != nil {
+		return err
+	}
+	buf = buf[:4]
+	_, err = conn.Read(buf)
+	if err != nil {
+		return err
+	}
+
+	respSize := binary.BigEndian.Uint32(buf)
+	resp := buf[:respSize]
+	_, err = conn.Read(resp)
+	if err != nil {
+		return err
+	}
+
+	var mdxResp connectorspb.MetadataExchangeResponse
+	err = proto.Unmarshal(resp, &mdxResp)
+	if err != nil {
+		return err
+	}
+
+	if mdxResp.GetResponseCode() != connectorspb.MetadataExchangeResponse_OK {
+		return errors.New(mdxResp.GetError())
+	}
+
+	return nil
+}
+
+const maxMessageSize = 16 * 1024 // 16 kb
+
+type buffer struct {
+	pool sync.Pool
+}
+
+func newBuffer() *buffer {
+	return &buffer{
+		pool: sync.Pool{
+			New: func() any {
+				buf := make([]byte, maxMessageSize)
+				return &buf
+			},
+		},
+	}
+}
+
+func (b *buffer) get() *[]byte {
+	return b.pool.Get().(*[]byte)
+}
+
+func (b *buffer) put(buf *[]byte) {
+	b.pool.Put(buf)
 }
 
 // newInstrumentedConn initializes an instrumentedConn that on closing will
