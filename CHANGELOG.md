@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/GoogleCloudPlatform/alloydb-go-connector/compare/v1.4.1...v1.5.0) (2023-10-13)
+
+
+### Features
+
+* add pgx v5 support ([#395](https://github.com/GoogleCloudPlatform/alloydb-go-connector/issues/395)) ([#413](https://github.com/GoogleCloudPlatform/alloydb-go-connector/issues/413)) ([c07799c](https://github.com/GoogleCloudPlatform/alloydb-go-connector/commit/c07799cbd194d003e558be136961511b37481f4f))
+
 ## [1.4.1](https://github.com/GoogleCloudPlatform/alloydb-go-connector/compare/v1.4.0...v1.4.1) (2023-10-11)
 
 
